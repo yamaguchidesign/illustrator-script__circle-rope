@@ -3,16 +3,25 @@ if (app.documents.length > 0 && app.activeDocument.selection.length >= 2) {
     var doc = app.activeDocument;
     var sel = doc.selection;
 
-    // 選択されたオブジェクトがすべてパスかチェック
-    var allPaths = true;
+    // 選択されたオブジェクトがすべて円かチェック
+    var allCircles = true;
+    var invalidObjectType = "";
     for (var i = 0; i < sel.length; i++) {
         if (sel[i].typename != "PathItem") {
-            allPaths = false;
+            allCircles = false;
+            invalidObjectType = "パス以外のオブジェクト";
+            break;
+        }
+
+        // 円の形状かどうかをチェック
+        if (!isCircularShape(sel[i])) {
+            allCircles = false;
+            invalidObjectType = "楕円または四角形などの非円形オブジェクト";
             break;
         }
     }
 
-    if (allPaths) {
+    if (allCircles) {
         try {
             // 各円の中心座標と半径を取得
             var circles = [];
@@ -56,26 +65,13 @@ if (app.documents.length > 0 && app.activeDocument.selection.length >= 2) {
                             pt.rightDirection = rectangle[i];
                         }
                     }
-                } else if (circles.length === 3) {
-                    // 3つの円の場合は各ペアを四角形で繋ぐ
-                    createThreeCircleRectangles(circles, frontmostColor, doc);
                 } else {
-                    // 4つ以上の円の場合は全体を囲む多角形
-                    var polygonPath = createPolygonPath(ropeSegments, circles);
+                    // 3つ以上の円の場合は全てのペアを四角形で繋いで結合
+                    var createdPaths = createAllPairRectangles(circles, frontmostColor, doc);
 
-                    if (polygonPath && polygonPath.length > 0) {
-                        var polyPath = doc.pathItems.add();
-                        polyPath.stroked = false;
-                        polyPath.filled = true;
-                        polyPath.closed = true;
-                        polyPath.fillColor = frontmostColor;
-
-                        for (var i = 0; i < polygonPath.length; i++) {
-                            var pt = polyPath.pathPoints.add();
-                            pt.anchor = polygonPath[i];
-                            pt.leftDirection = polygonPath[i];
-                            pt.rightDirection = polygonPath[i];
-                        }
+                    if (createdPaths.length > 0) {
+                        // 作成した四角形を結合して隙間を埋める
+                        combineRectanglesAndFillGaps(createdPaths, circles, frontmostColor, doc);
                     }
                 }
             } else {
@@ -85,10 +81,72 @@ if (app.documents.length > 0 && app.activeDocument.selection.length >= 2) {
             alert("エラーが発生しました: " + e.message);
         }
     } else {
-        alert("選択されたオブジェクトはすべてパス（円）である必要があります。");
+        alert("エラー: " + invalidObjectType + "が含まれています。このスクリプトは正円（真円）のみに対応しています。");
     }
 } else {
     alert("2つ以上のパス（円）を選んでください。");
+}
+
+// オブジェクトが円の形状かどうかをチェックする関数
+function isCircularShape(obj) {
+    try {
+        // パスオブジェクトでない場合は円ではない
+        if (obj.typename !== "PathItem") {
+            return false;
+        }
+
+        // 幅と高さを取得
+        var width = Math.abs(obj.width);
+        var height = Math.abs(obj.height);
+
+        // 幅または高さが0の場合は円ではない
+        if (width === 0 || height === 0) {
+            return false;
+        }
+
+        // 幅と高さの比率をチェック（許容誤差5%）
+        var ratio = width / height;
+        var tolerance = 0.05; // 5%の許容誤差
+
+        if (ratio < (1 - tolerance) || ratio > (1 + tolerance)) {
+            return false; // 楕円または他の形状
+        }
+
+        // パスポイントの数をチェック（円は通常4つのパスポイント）
+        if (obj.pathPoints.length < 4) {
+            return false; // 三角形など
+        }
+
+        // 四角形の検出：パスポイントが4つで直線的な場合
+        if (obj.pathPoints.length === 4) {
+            var hasValidCurves = false;
+            for (var i = 0; i < obj.pathPoints.length; i++) {
+                var point = obj.pathPoints[i];
+                // ベジェハンドルがあるかチェック（円の場合は必要）
+                var leftHandle = point.leftDirection;
+                var rightHandle = point.rightDirection;
+                var anchor = point.anchor;
+
+                // ハンドルが錨点と異なる位置にある場合（カーブがある）
+                if ((leftHandle[0] !== anchor[0] || leftHandle[1] !== anchor[1]) ||
+                    (rightHandle[0] !== anchor[0] || rightHandle[1] !== anchor[1])) {
+                    hasValidCurves = true;
+                    break;
+                }
+            }
+
+            // 4つのポイントがすべて直線的な場合は四角形
+            if (!hasValidCurves) {
+                return false;
+            }
+        }
+
+        return true; // 円と判定
+
+    } catch (e) {
+        // エラーが発生した場合は円ではないと判定
+        return false;
+    }
 }
 
 // 色を作成する関数
@@ -216,109 +274,144 @@ function createRectanglePaths(ropeSegments, color) {
     return rectangles;
 }
 
-// 3つの円の場合に各ペアを四角形で繋ぐ関数
-function createThreeCircleRectangles(circles, color, doc) {
-    // 3つの円のペア組み合わせ: (0,1), (1,2), (2,0)
-    var pairs = [
-        [0, 1], // 円0と円1
-        [1, 2], // 円1と円2
-        [2, 0]  // 円2と円0
-    ];
+// 全ての円のペアを四角形で繋ぐ関数（3つ以上の円用）
+function createAllPairRectangles(circles, color, doc) {
+    var createdPaths = []; // 作成したパスアイテムを保存
 
-    for (var p = 0; p < pairs.length; p++) {
-        var circle1Index = pairs[p][0];
-        var circle2Index = pairs[p][1];
-        var circle1 = circles[circle1Index];
-        var circle2 = circles[circle2Index];
+    // 全ての円ペアの組み合わせを生成
+    for (var i = 0; i < circles.length; i++) {
+        for (var j = i + 1; j < circles.length; j++) {
+            var circle1 = circles[i];
+            var circle2 = circles[j];
 
-        // この2つの円の外接線を計算
-        var tangents = calculateExternalTangents(circle1, circle2);
+            // この2つの円の外接線を計算
+            var tangents = calculateExternalTangents(circle1, circle2);
 
-        if (tangents.length >= 2) {
-            // 外接線から四角形を作成
-            var rectanglePaths = createRectanglePaths(tangents, color);
+            if (tangents.length >= 2) {
+                // 外接線から四角形を作成
+                var rectanglePaths = createRectanglePaths(tangents, color);
 
-            // 四角形をドキュメントに追加
-            for (var r = 0; r < rectanglePaths.length; r++) {
-                var rectPath = doc.pathItems.add();
-                rectPath.stroked = false;
-                rectPath.filled = true;
-                rectPath.closed = true;
-                rectPath.fillColor = color;
+                // 四角形をドキュメントに追加
+                for (var r = 0; r < rectanglePaths.length; r++) {
+                    var rectPath = doc.pathItems.add();
+                    rectPath.stroked = false;
+                    rectPath.filled = true;
+                    rectPath.closed = true;
+                    rectPath.fillColor = color;
 
-                var rectangle = rectanglePaths[r];
-                for (var i = 0; i < rectangle.length; i++) {
-                    var pt = rectPath.pathPoints.add();
-                    pt.anchor = rectangle[i];
-                    pt.leftDirection = rectangle[i];
-                    pt.rightDirection = rectangle[i];
+                    var rectangle = rectanglePaths[r];
+                    for (var k = 0; k < rectangle.length; k++) {
+                        var pt = rectPath.pathPoints.add();
+                        pt.anchor = rectangle[k];
+                        pt.leftDirection = rectangle[k];
+                        pt.rightDirection = rectangle[k];
+                    }
+
+                    // 作成したパスをリストに追加
+                    createdPaths.push(rectPath);
                 }
             }
         }
     }
+
+    return createdPaths;
 }
 
-// 3つ以上の円に対して全体を囲む多角形を作成する関数
-function createPolygonPath(ropeSegments, circles) {
-    var allPoints = [];
+// 作成した四角形を結合して隙間を埋める関数
+function combineRectanglesAndFillGaps(pathItems, circles, color, doc) {
+    try {
+        // 3つの円の場合、中央の隙間を埋める三角形を作成
+        if (circles.length === 3) {
+            createCenterTriangleForThreeCircles(circles, color, doc);
+        }
+        // 4つ以上の円の場合、中央の多角形を作成
+        else if (circles.length >= 4) {
+            createCenterPolygonForMultipleCircles(circles, color, doc);
+        }
 
-    // 全ての外接線の端点を集める
-    for (var i = 0; i < ropeSegments.length; i++) {
-        allPoints.push(ropeSegments[i].start);
-        allPoints.push(ropeSegments[i].end);
+        // 選択状態をクリア
+        doc.selection = null;
+
+    } catch (e) {
+        // エラーが発生しても処理を続行
+        try {
+            doc.selection = null;
+        } catch (e2) {
+            // 何もしない
+        }
     }
+}
 
-    if (allPoints.length === 0) return [];
+// 3つの円の中央の隙間を埋める三角形を作成する関数
+function createCenterTriangleForThreeCircles(circles, color, doc) {
+    try {
+        // 3つの円の中心点で三角形を作成
+        if (circles.length === 3) {
+            var trianglePath = doc.pathItems.add();
+            trianglePath.stroked = false;
+            trianglePath.filled = true;
+            trianglePath.closed = true;
+            trianglePath.fillColor = color;
 
-    // 重複する点を除去（近い点は同じ点として扱う）
-    var uniquePoints = [];
-    for (var i = 0; i < allPoints.length; i++) {
-        var isDuplicate = false;
-        for (var j = 0; j < uniquePoints.length; j++) {
-            var dx = allPoints[i][0] - uniquePoints[j][0];
-            var dy = allPoints[i][1] - uniquePoints[j][1];
-            var distance = Math.sqrt(dx * dx + dy * dy);
-            if (distance < 5) { // 5pt以内は同じ点として扱う
-                isDuplicate = true;
-                break;
+            // 三角形の頂点を追加（円の中心点）
+            for (var i = 0; i < circles.length; i++) {
+                var pt = trianglePath.pathPoints.add();
+                pt.anchor = circles[i].center;
+                pt.leftDirection = circles[i].center;
+                pt.rightDirection = circles[i].center;
             }
         }
-        if (!isDuplicate) {
-            uniquePoints.push(allPoints[i]);
+
+    } catch (e) {
+        // エラーが発生しても処理を続行
+    }
+}
+
+// 4つ以上の円の中央の隙間を埋める多角形を作成する関数
+function createCenterPolygonForMultipleCircles(circles, color, doc) {
+    try {
+        // 全ての円の中心を計算
+        var centerX = 0, centerY = 0;
+        for (var i = 0; i < circles.length; i++) {
+            centerX += circles[i].center[0];
+            centerY += circles[i].center[1];
         }
-    }
+        centerX /= circles.length;
+        centerY /= circles.length;
 
-    // 全ての円の中心を計算
-    var centerX = 0, centerY = 0;
-    for (var i = 0; i < circles.length; i++) {
-        centerX += circles[i].center[0];
-        centerY += circles[i].center[1];
-    }
-    centerX /= circles.length;
-    centerY /= circles.length;
+        // 円の中心点を角度でソート
+        var pointsWithAngle = [];
+        for (var i = 0; i < circles.length; i++) {
+            var angle = Math.atan2(circles[i].center[1] - centerY, circles[i].center[0] - centerX);
+            pointsWithAngle.push({
+                point: circles[i].center,
+                angle: angle
+            });
+        }
 
-    // 中心点からの角度で各点をソート
-    var pointsWithAngle = [];
-    for (var i = 0; i < uniquePoints.length; i++) {
-        var angle = Math.atan2(uniquePoints[i][1] - centerY, uniquePoints[i][0] - centerX);
-        pointsWithAngle.push({
-            point: uniquePoints[i],
-            angle: angle
+        // 角度でソート
+        pointsWithAngle.sort(function (a, b) {
+            return a.angle - b.angle;
         });
+
+        // 中央の多角形を作成
+        var polygonPath = doc.pathItems.add();
+        polygonPath.stroked = false;
+        polygonPath.filled = true;
+        polygonPath.closed = true;
+        polygonPath.fillColor = color;
+
+        // 多角形の頂点を追加
+        for (var i = 0; i < pointsWithAngle.length; i++) {
+            var pt = polygonPath.pathPoints.add();
+            pt.anchor = pointsWithAngle[i].point;
+            pt.leftDirection = pointsWithAngle[i].point;
+            pt.rightDirection = pointsWithAngle[i].point;
+        }
+
+    } catch (e) {
+        // エラーが発生しても処理を続行
     }
-
-    // 角度でソート（反時計回り）
-    pointsWithAngle.sort(function (a, b) {
-        return a.angle - b.angle;
-    });
-
-    // ソートされた点のみを返す
-    var sortedPoints = [];
-    for (var i = 0; i < pointsWithAngle.length; i++) {
-        sortedPoints.push(pointsWithAngle[i].point);
-    }
-
-    return sortedPoints;
 }
 
 // 円と円を繋ぐロープセグメントを計算する関数
